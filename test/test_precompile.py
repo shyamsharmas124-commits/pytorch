@@ -14,6 +14,7 @@ import tempfile
 import textwrap
 import typing
 import unittest
+import uuid
 from unittest import mock
 
 import torch
@@ -21,7 +22,13 @@ import torch.utils._pytree as _pytree
 from torch._dynamo.decorators import mark_dynamic, mark_unbacked
 from torch._precompile import _write_artifact, PrecompileError
 from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.compiler.precompile import capture, load, MakeFxTracer, PrecompiledRunnable
+from torch.compiler.precompile import (
+    capture,
+    DynamoTracer,
+    load,
+    MakeFxTracer,
+    PrecompiledRunnable,
+)
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing import make_tensor
 from torch.testing._internal.common_cuda import TEST_CUDA
@@ -30,6 +37,7 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
+    skipIfCrossRef,
     skipIfTorchDynamo,
     TestCase,
 )
@@ -2826,6 +2834,7 @@ class TestPrecompile(TestCase):
             "capture",
             "load",
             "Capture",
+            "DynamoTracer",
             "MakeFxTracer",
             "PrecompiledRunnable",
             "PrecompileSummary",
@@ -4482,6 +4491,216 @@ class TestPrecompileCapture(TestCase):
             with self._capture(step, backend="eager") as cap:
                 cap(self.model, self.x)
         self.assertFalse(os.path.exists(self.artifact))
+
+
+_GOLDEN_MODULE = """
+import torch
+
+SCALE = 2
+
+
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = torch.nn.Linear(4, 4)
+
+    def forward(self, x):
+        return torch.relu(self.lin(x))
+
+
+def step(model, x, *, scale=1.0):
+    y = model(x) * scale * SCALE
+    torch._dynamo.graph_break()
+    if y.shape[0] > 2:
+        y = y + 1
+    return y.sum(dim=0)
+
+
+def single(model, x):
+    return model(x).sum(dim=0)
+
+
+def train_step(model, x):
+    model(x).sum().backward()
+"""
+
+_GOLDEN_LOADER = """
+import sys
+import torch
+
+tmp, module, artifact, cache, state = sys.argv[1:6]
+sys.path.insert(0, tmp)
+mod = __import__(module)
+saved = torch.load(state)
+model = mod.Model()
+model.load_state_dict(saved["state_dict"])
+f = torch.compiler.precompile.load(artifact, cache)
+for args, kwargs, expected in saved["calls"]:
+    torch.testing.assert_close(f(model, *args, **kwargs), expected)
+try:
+    f(model, saved["calls"][0][0][0].double())
+except torch.compiler.PrecompileError as e:
+    assert "no captured variant" in str(e), e
+else:
+    raise AssertionError("an uncovered call was served")
+print("served")
+"""
+
+
+@skipIfTorchDynamo("precompile captures cannot run under dynamo wrapping")
+@instantiate_parametrized_tests
+class TestPrecompileDynamoCapture(TestCase):
+    """capture() with the DynamoTracer: the multi-graph standalone artifact."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.artifact = os.path.join(self.dir, "m.py")
+        self.cache = os.path.join(self.dir, "m.cache")
+        # A fresh module per test: Dynamo caches compiled code on the code
+        # objects, and the artifact names the module it was compiled in.
+        self.module_name = f"precompile_golden_{uuid.uuid4().hex}"
+        with open(os.path.join(self.dir, self.module_name + ".py"), "w") as f:
+            f.write(_GOLDEN_MODULE)
+        sys.path.insert(0, self.dir)
+        self.addCleanup(sys.path.remove, self.dir)
+        self.mod = importlib.import_module(self.module_name)
+        self.addCleanup(sys.modules.pop, self.module_name, None)
+        self.model = self.mod.Model()
+        self.x2 = torch.randn(2, 4)
+        self.x3 = torch.randn(3, 4)
+
+    def _capture(self, fn, **kwargs):
+        kwargs.setdefault("tracer", DynamoTracer())
+        return capture(fn, artifact_path=self.artifact, cache_path=self.cache, **kwargs)
+
+    def _serve_in_fresh_process(self, calls):
+        state = os.path.join(self.dir, "state.pt")
+        torch.save({"state_dict": self.model.state_dict(), "calls": calls}, state)
+        argv = [self.dir, self.module_name, self.artifact, self.cache, state]
+        out = subprocess.run(
+            [sys.executable, "-c", _GOLDEN_LOADER, *argv],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("served", out.stdout)
+
+    # The crossref harness keeps a dispatch mode active while the capture runs,
+    # and Dynamo guards on that state; a fresh process has no such mode, so
+    # every variant would miss there.
+    @skipIfCrossRef
+    @parametrize("backend", ["inductor", "eager"])
+    def test_graph_breaks_and_recompiles_round_trip_in_a_fresh_process(self, backend):
+        step = self.mod.step
+        with self._capture(step, backend=backend) as cap:
+            # Two shapes: the branch after the graph break recompiles the
+            # continuation, and the keyword argument is a second entry variant.
+            y2 = cap(self.model, self.x2)
+            y3 = cap(self.model, self.x3, scale=0.5)
+        self.assertEqual(y2, step(self.model, self.x2))
+        self.assertEqual(y3, step(self.model, self.x3, scale=0.5))
+        with open(self.artifact) as f:
+            python_code = f.read()
+        self.assertIn('TRACER = "dynamo"', python_code)
+        self.assertIn('SERVING_MODE = "standalone"', python_code)
+        self.assertIn(f"FN_NAME = {step.__qualname__!r}", python_code)
+        # A capture that graph-broke cannot load beside the live compile that
+        # captured it: the continuation names collide, and load says so.
+        with self.assertRaisesRegex(PrecompileError, "fresh process"):
+            load(self.artifact, self.cache)
+        self._serve_in_fresh_process(
+            [((self.x2,), {}, y2), ((self.x3,), {"scale": 0.5}, y3)]
+        )
+
+    @parametrize("backend", ["inductor", "eager"])
+    def test_a_single_graph_serves_in_process(self, backend):
+        single = self.mod.single
+        with self._capture(single, backend=backend) as cap:
+            y = cap(self.model, self.x2)
+        self.assertEqual(y, single(self.model, self.x2))
+        f = load(self.artifact, self.cache)
+        self.assertIsInstance(f, PrecompiledRunnable)
+        self.assertFalse(f.installed)
+        self.assertEqual(f(self.model, self.x2), y)
+        other = self.mod.Model()
+        self.assertEqual(f(other, self.x2), single(other, self.x2))
+        with f:
+            pass
+        f.unload()
+        # No compiler behind a standalone artifact: an uncovered call raises.
+        with self.assertRaisesRegex(PrecompileError, "no captured variant"):
+            f(self.model, self.x3)
+
+    def test_training_step_grads_match_eager_in_a_fresh_process(self):
+        expected = self.mod.Model()
+        expected.load_state_dict(self.model.state_dict())
+        expected(self.x2).sum().backward()
+        with self._capture(self.mod.train_step, backend="eager") as cap:
+            self.assertIsNone(cap(self.model, self.x2))
+        self.assertEqual(self.model.lin.weight.grad, expected.lin.weight.grad)
+        self.assertEqual(self.model.lin.bias.grad, expected.lin.bias.grad)
+
+    def test_a_raised_call_is_refused_at_exit_and_writes_nothing(self):
+        # A call that raised inside the block is a coverage gap: the default gate
+        # refuses at exit, after the block ran to completion, and writes nothing.
+        with self.assertRaisesRegex(PrecompileError, "captured call raised"):
+            with self._capture(self.mod.step, backend="eager") as cap:
+                cap(self.model, self.x2)
+                with self.assertRaises(RuntimeError):
+                    cap(self.model, torch.randn(2, 5))
+        self.assertFalse(os.path.exists(self.artifact))
+        self.assertFalse(os.path.exists(self.cache))
+
+    def test_the_strict_gate_refuses_dropped_guards(self):
+        # The default filter drops the identity guards that cannot be
+        # serialized (the MODULE_MATCH on the model here); the artifact lists
+        # them, and the strict gate refuses them.
+        with self._capture(self.mod.single, backend="eager") as cap:
+            cap(self.model, self.x2)
+        with open(self.artifact) as f:
+            self.assertIn("['MODULE_MATCH', ", f.read())
+        strict = DynamoTracer(require_no_dropped_guards=True)
+        with self.assertRaisesRegex(PrecompileError, "dropped .* guard"):
+            with self._capture(self.mod.single, backend="eager", tracer=strict) as cap:
+                cap(self.model, self.x2)
+
+    def test_entries_a_standalone_artifact_cannot_rebuild_are_refused(self):
+        # A bare nn.Module compiles Dynamo's wrapper frame, whose graphs close
+        # over the module; a closure entry cannot be rebuilt from a code object.
+        with self.assertRaisesRegex(PrecompileError, "CALLS the model"):
+            self._capture(self.model, backend="eager")
+        k = 3
+
+        def closure(model, x):
+            return model(x) * k
+
+        with self.assertRaisesRegex(PrecompileError, "closes over"):
+            with self._capture(closure, backend="eager") as cap:
+                cap(self.model, self.x2)
+        with self.assertRaisesRegex(TypeError, "partial"):
+            self._capture(functools.partial(self.mod.single, self.model))
+
+    def test_a_dynamo_pair_does_not_mix_with_a_make_fx_pair(self):
+        with self._capture(self.mod.single, backend="eager") as cap:
+            cap(self.model, self.x2)
+        other_artifact = os.path.join(self.dir, "fx.py")
+        other_cache = os.path.join(self.dir, "fx.cache")
+        with capture(
+            self.mod.single,
+            artifact_path=other_artifact,
+            cache_path=other_cache,
+            tracer=MakeFxTracer(),
+            backend="eager",
+        ) as cap:
+            cap(self.model, self.x2)
+        with self.assertRaisesRegex(PrecompileError, "tracer"):
+            load(self.artifact, other_cache)
+        with self.assertRaisesRegex(PrecompileError, "tracer|does not match"):
+            load(other_artifact, self.cache)
 
 
 if __name__ == "__main__":
