@@ -1149,7 +1149,8 @@ class TestPrecompile(TestCase):
         # The artifact is the only compiled blob; the rest is the integrity tag (the
         # format/version/backend tag plus a code_hash binding the cache to its python_code).
         self.assertEqual(
-            set(blob), {"artifact", "format", "version", "backend", "code_hash"}
+            set(blob),
+            {"artifact", "format", "version", "backend", "tracer", "code_hash"},
         )
         self.assertEqual(blob["format"], _CACHE_FORMAT)
         self.assertEqual(blob["version"], _CACHE_VERSION)
@@ -1195,7 +1196,8 @@ class TestPrecompile(TestCase):
         _code, cache = _precompile_pair(lambda model, x: model(x), m, x)
         blob = torch.load(io.BytesIO(cache), weights_only=True)  # must not raise
         self.assertEqual(
-            set(blob), {"artifact", "format", "version", "backend", "code_hash"}
+            set(blob),
+            {"artifact", "format", "version", "backend", "tracer", "code_hash"},
         )
         self.assertEqual(blob["format"], _CACHE_FORMAT)
         self.assertEqual(blob["version"], _CACHE_VERSION)
@@ -1837,7 +1839,8 @@ class TestPrecompile(TestCase):
 
         blob = torch.load(io.BytesIO(cache), weights_only=False)
         self.assertEqual(
-            set(blob), {"artifact", "format", "version", "backend", "code_hash"}
+            set(blob),
+            {"artifact", "format", "version", "backend", "tracer", "code_hash"},
         )
         self.assertIsNone(blob["artifact"])  # eager has no compiled blob to bundle
         self.assertEqual(blob["format"], _CACHE_FORMAT)
@@ -2938,6 +2941,93 @@ class TestPrecompile(TestCase):
         self.assertIsNone(forward(served, x))
         self.assertEqual(served.weight.grad, expected.weight.grad)
         self.assertEqual(served.bias.grad, expected.bias.grad)
+
+    def test_multigraph_artifact_round_trips_a_hand_built_package(self):
+        # The renderer turns a package Dynamo filled into the (python_code, cache)
+        # pair load reads: readable metadata beside the opaque blobs, the tracer
+        # tag pairing the two halves, and a driver that serves the captured
+        # variants and refuses the rest.
+        from unittest import mock
+
+        from torch._dynamo.package import CompilePackage
+        from torch._dynamo.precompile_context import EagerCacheArtifact
+        from torch._dynamo.precompile_package import default_guard_filter_fn
+        from torch._precompile import (
+            _build_multigraph_artifact,
+            _parse_artifact_metadata,
+            _runnable_from_pair,
+        )
+        from torch.compiler.precompile import PrecompileSummary
+
+        def step(model, x, *, scale=2.0):
+            y = model(x) * scale * _MULTIGRAPH_SCALE
+            torch._dynamo.graph_break()
+            return y + y.shape[0]
+
+        model = torch.nn.Linear(4, 4)
+        x2, x3 = torch.randn(2, 4), torch.randn(3, 4)
+        package = CompilePackage(step)
+        compiled = torch._dynamo.optimize(
+            backend="eager", package=package, guard_filter_fn=default_guard_filter_fn
+        )(step)
+        expected2, expected3 = compiled(model, x2), compiled(model, x3)
+        entry = package.cache_entry()
+        backends = {
+            backend_id: EagerCacheArtifact(key=backend_id, content=backend)
+            for backend_id, backend in package.cached_backends.items()
+        }
+        summary = PrecompileSummary(
+            frames=len(entry.codes),
+            resume_functions=1,
+            guarded_codes=sum(len(c.guarded_codes) for c in entry.codes),
+            backend_graphs=len(backends),
+            dropped_guards=(("MODULE_MATCH", "model"),),
+        )
+        # The records name this module, which is __main__ under a script run and
+        # the driver refuses that; serve them from an importable alias of it.
+        module = "precompile_test_captured_module"
+        alias = mock.patch.dict(sys.modules, {module: sys.modules[__name__]})
+        self.addCleanup(alias.stop)
+        alias.start()
+        for code in entry.codes:
+            code.python_module = module
+        python_code, cache = _build_multigraph_artifact(
+            entry, backends, summary, "eager", step
+        )
+        meta = _parse_artifact_metadata(python_code)
+        self.assertEqual(meta["TRACER"], "dynamo")
+        self.assertEqual(meta["SERVING_MODE"], "standalone")
+        self.assertEqual(meta["BACKEND"], "eager")
+        self.assertEqual(meta["FN_NAME"], step.__qualname__)
+        self.assertEqual(
+            [name for name, _ in meta["FRAMES"]],
+            [c.python_code.co_name for c in entry.codes],
+        )
+        self.assertEqual(meta["DROPPED_GUARDS"], [["MODULE_MATCH", "model"]])
+        blob = torch.load(io.BytesIO(cache), weights_only=True)
+        self.assertEqual(blob["tracer"], "dynamo")
+        self.assertIsNone(blob["artifact"])
+        # A serving process never traced, so the names Dynamo minted into this
+        # module during capture must not be what makes the guards pass.
+        torch._dynamo.reset()
+        scope = step.__globals__
+        minted = ("__compiled_fn", "__resume_at", "__builtins_dict__", "__import_")
+
+        def scrub():
+            return {n: scope.pop(n) for n in list(scope) if n.startswith(minted)}
+
+        removed = scrub()
+        self.addCleanup(lambda: (scrub(), scope.update(removed)))
+        f = _runnable_from_pair(python_code, cache, _trusted=True)
+        self.assertFalse(f.installed)
+        self.assertEqual(f(model, x2), expected2)
+        self.assertEqual(f(model, x3), expected3)
+        with self.assertRaisesRegex(PrecompileError, "no captured variant"):
+            f(model, x2.double())
+        # The two halves pair on the tracer tag: a make_fx cache is refused.
+        _, fx_cache = _precompile_pair(_files_fn, _FilesModel(), x2, backend="eager")
+        with self.assertRaisesRegex(PrecompileError, "tracer"):
+            _runnable_from_pair(python_code, fx_cache)
 
     def test_nested_input_refused(self):
         # A nested example input is refused up front with a named PrecompileError rather
@@ -4111,6 +4201,35 @@ class TestPrecompileLoad(TestCase):
         )
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("served", out.stdout)
+
+    def _read(self, path):
+        with open(path, "rb") as f:
+            return f.read().decode()
+
+    def test_load_pairs_the_cache_on_its_tracer_tag(self):
+        # The envelope names the tracer that produced it; a tag that differs from
+        # the python_code's is a wrong pairing, and a pair written before the tag
+        # (absent on both sides) still reads as make_fx.
+        _, cache = self._write(self.artifact, self.cache)
+        blob = torch.load(io.BytesIO(cache), weights_only=True)
+        self.assertEqual(blob["tracer"], "make_fx")
+        blob["tracer"] = "dynamo"
+        buf = io.BytesIO()
+        torch.save(blob, buf)
+        _write_artifact(
+            self.artifact, self.cache, self._read(self.artifact), buf.getvalue()
+        )
+        with self.assertRaisesRegex(PrecompileError, "tracer"):
+            load(self.artifact, self.cache)
+        del blob["tracer"]
+        buf = io.BytesIO()
+        torch.save(blob, buf)
+        _write_artifact(
+            self.artifact, self.cache, self._read(self.artifact), buf.getvalue()
+        )
+        self.assertEqual(
+            load(self.artifact, self.cache)(self.model, self.x), self.model(self.x)
+        )
 
     def test_load_refuses_a_pair_from_two_captures_or_a_missing_cache(self):
         self._write(self.artifact, self.cache)
